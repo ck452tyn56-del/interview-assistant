@@ -9,3 +9,5 @@ __pycache__/
 assistant_secrets.py
 *.env
 assistant_settings.json
+assistant.pid
+.replace_requested

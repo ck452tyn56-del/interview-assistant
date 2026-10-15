@@ -784,6 +784,9 @@ class App:
         # применяем сохранённые настройки сети до первого подключения
         self._init_net()
 
+        # сторож замены: новый запуск попросит этот экземпляр закрыться
+        self._takeover_watch()
+
     def _on_focus(self, focused: bool):
         if focused == self.window_focused:
             return  # событие всплывает от каждого виджета — берём только смену состояния
@@ -1440,10 +1443,12 @@ class App:
             self.connect()
 
     def _on_close(self):
-        logging.info("[APP] Окно закрыто пользователем")
+        reason = "закрыто для замены новой версией" if getattr(self, "_replaced", False) \
+            else "закрыто пользователем"
+        logging.info(f"[APP] Окно {reason}")
         # флаг для супервизора: перезапускать не нужно
         try:
-            open(os.path.join(os.path.dirname(__file__) or '.', '.user_closed'), 'w').close()
+            open(USER_CLOSED_FLAG, 'w').close()
         except Exception:
             pass
         try:
@@ -1451,8 +1456,80 @@ class App:
         finally:
             self.root.destroy()
 
+    def _takeover_watch(self):
+        """Новый запуск записал флаг замены — закрываемся чисто и быстро,
+        освобождая место (контекст диалога переживёт замену через resumption)."""
+        try:
+            # пока мы живы, флаг закрытия может быть только устаревшим —
+            # от замещённого нами предшественника
+            if os.path.exists(USER_CLOSED_FLAG) and _read_pid_file() == os.getpid():
+                os.remove(USER_CLOSED_FLAG)
+            if os.path.exists(REPLACE_FLAG):
+                try:
+                    os.remove(REPLACE_FLAG)
+                except Exception:
+                    pass
+                logging.info("[APP] Поступил запрос на замену новой версией — закрываюсь")
+                self.root.after(150, self._on_close)
+                return
+        except Exception:
+            pass
+        self.root.after(500, self._takeover_watch)
+
 
 _MUTEX_HANDLE = None
+_PID_FILE = os.path.join(os.path.dirname(__file__) or '.', "assistant.pid")
+REPLACE_FLAG = os.path.join(os.path.dirname(__file__) or '.', ".replace_requested")
+USER_CLOSED_FLAG = os.path.join(os.path.dirname(__file__) or '.', ".user_closed")
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32')
+        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def _read_pid_file():
+    try:
+        with open(_PID_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _replace_previous_instance():
+    """Новый запуск замещает старый: вежливый сигнал, при необходимости —
+    точечное закрытие по PID. После этого мьютекс освобождается сам."""
+    pid = _read_pid_file()
+    if not pid or pid == os.getpid() or not _pid_alive(pid):
+        return
+    logging.info(f"[APP] Найден работающий экземпляр (PID {pid}) — замещаю его")
+    try:
+        with open(REPLACE_FLAG, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < 3.0 and _pid_alive(pid):
+        time.sleep(0.2)
+    if _pid_alive(pid):
+        logging.warning(f"[APP] Экземпляр PID {pid} не закрылся сам — закрываю по PID")
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True)
+        t0 = time.time()
+        while time.time() - t0 < 5.0 and _pid_alive(pid):
+            time.sleep(0.2)
+    logging.info("[APP] Предыдущий экземпляр закрыт")
 
 
 def _acquire_single_instance_lock() -> bool:
@@ -1472,12 +1549,25 @@ def _acquire_single_instance_lock() -> bool:
 
 
 if __name__ == "__main__":
+    # новый запуск замещает старый экземпляр вместо отказа
+    _replace_previous_instance()
+
     if not _acquire_single_instance_lock():
         # без блокирующих диалогов: молча логируем и выходим —
         # висящий messagebox сам становился вторым «призрачным» процессом
-        print("Уже запущен другой экземпляр Fast Assistant — этот закроется.")
+        print("Не удалось занять единственный слот — уже работает другой экземпляр.")
         logging.info("[APP] Повторный запуск отклонён: экземпляр уже работает")
         sys.exit(42)  # супервизор знает этот код: другой экземпляр работает
+
+    # фиксируем свой PID для будущих замен и убираем чужие флаги
+    try:
+        with open(_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        for stale in (USER_CLOSED_FLAG, REPLACE_FLAG):
+            if os.path.exists(stale):
+                os.remove(stale)
+    except Exception:
+        pass
 
     print(f"Fast Assistant v27 | MODE={MODE} | модели: " +
           ", ".join(m.replace('models/', '') for m, _ in MODEL_CANDIDATES))
