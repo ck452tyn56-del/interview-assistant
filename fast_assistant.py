@@ -1328,7 +1328,17 @@ class App:
                 return
             except Exception as e:
                 last_err = e
+                err = str(e)
                 logging.warning(f"[SESSION] Model {model} failed: {e}")
+                # понятная диагностика лимитов бесплатного тарифа
+                if any(s in err for s in ("429", "RESOURCE_EXHAUSTED", "quota",
+                                          "rate limit", "Too Many Requests")):
+                    self.root.after(0, lambda: self._set_status(
+                        "ЛИМИТ ТАРИФА ИСТОЩЁН — подожди (сброс в 0:00 по тихоокеанскому)",
+                        "#ff4444"))
+                elif "location" in err:
+                    self.root.after(0, lambda: self._set_status(
+                        "РЕГИОН ЗАБЛОКИРОВАН — проверь туннель/прокси", "#ff4444"))
                 self.resume_handle = None
                 continue
 
