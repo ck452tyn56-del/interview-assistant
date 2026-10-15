@@ -110,12 +110,13 @@ MODEL_CANDIDATES = [
 
 MODE = "ptt"        # "ptt" = пробел держать=говорить | "auto" = слушает всегда, VAD
 # Как работает пробел в MODE="ptt":
-#  "vad"    — пока пробел зажат, звук идёт на сервер, серверный VAD сам ловит конец речи
-#             (пауза 500мс): транскрипция видна В РЕАЛЬНОМ ВРЕМЕНИ, ответ может начаться
-#             ещё до отпускания пробела. Рекомендуется.
-#  "manual" — строгий режим: реплика заканчивается только отпусканием пробела;
-#             транскрипция приходит только ПОСЛЕ отпускания.
-PTT_STYLE = "vad"
+#  "manual" — строгий режим (по умолчанию): реплика = ровно от нажатия до отпускания
+#             пробела, сервер ничего не режет и не решает сам. Транскрипция приходит
+#             после отпускания. + кольцевой буфер 1с до нажатия (начало не теряется).
+#  "vad"    — пока пробел зажат, звук идёт на сервер, серверный VAD сам ловит конец
+#             речи (пауза 500мс): транскрипция видна в реальном времени, НО длинные
+#             вопросы с паузами могут резаться на несколько реплик.
+PTT_STYLE = "manual"
 CHUNK_DURATION = 0.1  # 100мс — проверено в v26
 
 # Прокси для обхода региональной блокировки Gemini API (SSH-туннель: plink -D 8081).
@@ -212,6 +213,9 @@ class AudioCapture:
         self.lb_rate = 0
         self.lb_ch = 1
         self.lb_thread_started = False
+        # кольцевой буфер: последняя секунда звука ДО нажатия пробела,
+        # чтобы не терялось начало реплики (важно для системного звука в конференциях)
+        self._ring = np.array([], dtype=np.int16)
 
     def _safe_device_name(self, info):
         return str(info.get("name", "unknown")).strip()
@@ -322,7 +326,7 @@ class AudioCapture:
                         def callback(indata, frames, time_info, status, self=self, channels=channels):
                             if status:
                                 logging.debug(f"[AUDIO] sounddevice status: {status}")
-                            if self.running and not self.muted:
+                            if self.running:
                                 raw = np.asarray(indata, dtype=np.int16)
                                 arr = raw.reshape(-1, channels).mean(axis=1).astype(np.int16) \
                                     if channels > 1 else raw.reshape(-1).astype(np.int16)
@@ -394,9 +398,8 @@ class AudioCapture:
                 arr = np.frombuffer(data, dtype=np.int16)
                 if self.lb_ch > 1:
                     arr = arr.reshape(-1, self.lb_ch).mean(axis=1).astype(np.int16)
-                if not self.muted:
-                    with self.lock:
-                        self.lb_buf.append(arr)
+                with self.lock:
+                    self.lb_buf.append(arr)
             except Exception as e:
                 logging.warning(f"[AUDIO] Loopback read stopped: {e}")
                 break
@@ -460,9 +463,8 @@ class AudioCapture:
                 arr = np.frombuffer(data, dtype=np.int16)
                 if self.mic_ch > 1:
                     arr = arr.reshape(-1, self.mic_ch).mean(axis=1).astype(np.int16)
-                if not self.muted:
-                    with self.lock:
-                        self.mic_buf.append(arr)
+                with self.lock:
+                    self.mic_buf.append(arr)
             except Exception as e:
                 logging.error(f"[AUDIO] Microphone read stopped: {e}", exc_info=True)
                 break
@@ -487,6 +489,23 @@ class AudioCapture:
                 self.q.put(np.zeros(chunk, dtype=np.int16).tobytes())
                 continue
 
+            dev_rate = self.lb_rate if (self.source == "system" and self.lb_rate) else self.mic_rate
+
+            if self.muted:
+                # пробел не зажат: копим последнюю секунду в кольцевой буфер,
+                # на сервер шлём тишину (соединение живо, реплика не начата)
+                if dev_rate:
+                    self._ring = np.concatenate((self._ring, mc))[-int(dev_rate):]
+                self.current_volume = max(0.0, self.current_volume - 20)
+                self.q.put(np.zeros(chunk, dtype=np.int16).tobytes())
+                continue
+
+            # пробел зажат: если есть предыстория — приклеиваем её перед текущим
+            # звуком, чтобы начало реплики (нажал чуть позже) не потерялось
+            if len(self._ring):
+                mc = np.concatenate((self._ring, mc))
+                self._ring = np.array([], dtype=np.int16)
+
             # DSP: убираем DC offset, мягко усиливаем тихую речь (не зануляя её),
             # клипуем и приводим к 16кГц моно. Наработка из v26 — отвечает за то,
             # что речь вообще доходит до распознавания.
@@ -500,11 +519,12 @@ class AudioCapture:
                 gain = max(1.0, min(6.0, 1000.0 / rms))
                 arr = arr * gain
             arr = np.clip(arr, -28000, 28000).astype(np.int16)
-            dev_rate = self.lb_rate if (self.source == "system" and self.lb_rate) else self.mic_rate
             arr = self._resample(arr, dev_rate, 16000)
 
             self.current_volume = min(100.0, (rms / 3000.0) * 100.0)
-            arr = np.pad(arr, (0, max(0, chunk - len(arr))))[:chunk]
+            # короткий чанк дополняем; длинный (с приклеенной предысторией) шлём целиком
+            if len(arr) < chunk:
+                arr = np.pad(arr, (0, chunk - len(arr)))
             self.q.put(arr.tobytes())
 
     def stop(self):
@@ -605,6 +625,7 @@ class App:
                                                fg="#ff9800", font=("Consolas", 11),
                                                wrap=tk.WORD, borderwidth=0)
         self.heard.pack(fill=tk.X, padx=10, pady=2)
+        self.heard.configure(state=tk.DISABLED)  # только чтение: без каретки и правки
 
         # === ANSWERS: две чередующиеся панели, прошлый ответ не перекрывается ===
         tk.Label(self.root, text="Ответы (чередуются строка 1 / строка 2):", fg="#00ff88",
@@ -674,21 +695,30 @@ class App:
         txt = scrolledtext.ScrolledText(f, bg=bg, fg="#00ff88", font=("Consolas", MAX_FONT),
                                         wrap=tk.WORD, borderwidth=1)
         txt.pack(fill=tk.BOTH, expand=True)
+        # только чтение: каретки и правки нет, выделение мышью и копирование работают
+        txt.configure(state=tk.DISABLED)
         return {"lbl": lbl, "txt": txt}
+
+    def _set_text(self, widget, text):
+        """Запись в read-only виджет (временно включаем правку)."""
+        widget.configure(state=tk.NORMAL)
+        widget.delete(1.0, tk.END)
+        widget.insert(tk.END, text)
+        widget.configure(state=tk.DISABLED)
+
+    def _clear_text(self, widget):
+        widget.configure(state=tk.NORMAL)
+        widget.delete(1.0, tk.END)
+        widget.configure(state=tk.DISABLED)
 
     # ---------- UI helpers ----------
     def _fit(self, widget, text):
         """Автоподбор размера шрифта, чтобы текст влезал целиком."""
         if getattr(self, '_fitting', False):
-            try:
-                widget.configure(font=("Consolas", MIN_FONT))
-                widget.delete(1.0, tk.END)
-                widget.insert(tk.END, text)
-            except Exception:
-                pass
             return
 
         self._fitting = True
+        widget.configure(state=tk.NORMAL)
         try:
             self.root.update_idletasks()
             w, h = widget.winfo_width(), widget.winfo_height()
@@ -713,6 +743,7 @@ class App:
         except Exception as e:
             logging.warning(f"[FIT] Error: {e}")
         finally:
+            widget.configure(state=tk.DISABLED)
             self._fitting = False
 
     def _highlight(self):
@@ -768,25 +799,34 @@ class App:
 
     def _hotkey(self):
         VK_SPACE = 0x20
+        listener_ref = {}  # фильтру нужен доступ к listener'у для suppress_event()
 
         def space_filter(msg, data):
-            """Windows: глотаем пробел, когда он управляет PTT, чтобы он не
-            печатался как зажатая клавиша в редакторах и чатах."""
+            """Windows: глотаем пробел СИСТЕМНО (suppress_event), когда он
+            управляет PTT, чтобы он не печатался в редакторах и чатах.
+            Замечание: return False только пропускает колбэк, НЕ блокируя
+            клавишу — блокирует именно suppress_event()."""
+            suppress = False
             try:
                 if MODE != "ptt" or data.vkCode != VK_SPACE:
                     return None
                 down = msg in (0x0100, 0x0104)   # WM_KEYDOWN / WM_SYSKEYDOWN
                 up = msg in (0x0101, 0x0105)      # WM_KEYUP / WM_SYSKEYUP
                 if down:
-                    if not self.window_focused and not self._global_space:
-                        return None  # пробел не наш — печатается как обычно
-                    self._ptt_start()
-                    return False     # не пропускать в другие приложения
-                if up and self.ptt_held:
+                    if self.window_focused or self._global_space:
+                        self._ptt_start()
+                        suppress = True
+                elif up and self.ptt_held:
                     self._ptt_end()
-                    return False
+                    suppress = True
             except Exception:
-                pass
+                return None
+            if suppress:
+                lst = listener_ref.get("obj")
+                if lst is not None:
+                    # бросает SuppressException -> событие не уйдёт другим приложениям
+                    lst.suppress_event()
+                return False
             return None
 
         def press(k):
@@ -820,6 +860,7 @@ class App:
         except TypeError:
             # старый pynput без win32_event_filter — работаем как раньше
             listener = keyboard.Listener(on_press=press, on_release=release)
+        listener_ref["obj"] = listener
         listener.start()
 
     def _send_to_session(self, coro_factory):
@@ -848,7 +889,7 @@ class App:
         self._turn_first_text = False
         self._turn_heard_speech = False
         self._awaiting_speech_check = False
-        self.root.after(0, lambda: self.heard.delete(1.0, tk.END))
+        self.root.after(0, lambda: self._clear_text(self.heard))
         self.root.after(0, lambda: self._set_status("СЛУШАЮ...", "#00ff88"))
         logging.info("[PTT] start: микрофон открыт")
         if self._manual_activity:
@@ -881,8 +922,7 @@ class App:
 
     # ---------- ответы ----------
     def _show_heard(self, text):
-        self.heard.delete(1.0, tk.END)
-        self.heard.insert(tk.END, text)
+        self._set_text(self.heard, text)
 
     def _on_output_text(self, chunk):
         if not self._turn_first_text:
@@ -893,7 +933,7 @@ class App:
                 logging.info(f"[LATENCY] Реакция: {lat:.2f}s")
             # чистим панель от позапрошлого ответа
             panel = self.p1 if self.current_row == 1 else self.p2
-            panel["txt"].delete(1.0, tk.END)
+            self._clear_text(panel["txt"])
 
         self.response += chunk
         panel = self.p1 if self.current_row == 1 else self.p2
@@ -1051,8 +1091,7 @@ class App:
             msg = "MIC ERROR: не удалось открыть микрофон. Проверь приватность микрофона Windows."
             logging.error(f"[AUDIO] {msg} Details: {getattr(self.audio, 'mic_error', None)}")
             self.root.after(0, lambda: self._set_status("MIC ERROR", "#ff4444"))
-            self.root.after(0, lambda: (self.heard.delete(1.0, tk.END),
-                                        self.heard.insert(tk.END, msg)))
+            self.root.after(0, lambda m=msg: self._set_text(self.heard, m))
         else:
             ready_txt = "ГОТОВ — держи ПРОБЕЛ" if MODE == "ptt" else "LISTENING"
             self.root.after(0, lambda: self._set_status(ready_txt, "#00ff88"))
@@ -1161,8 +1200,8 @@ class App:
         self.heard_final = ""
         self._highlight()
         for p in [self.p1, self.p2]:
-            p["txt"].delete(1.0, tk.END)
-        self.heard.delete(1.0, tk.END)
+            self._clear_text(p["txt"])
+        self._clear_text(self.heard)
         self.response = ""
         self.latency_lbl.config(text="⚡ --")
         time.sleep(0.3)
