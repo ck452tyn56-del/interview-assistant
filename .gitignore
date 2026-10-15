@@ -11,3 +11,8 @@ assistant_secrets.py
 assistant_settings.json
 assistant.pid
 .replace_requested
+build/
+dist/
+*.spec
+windows-installer/FastAssistant.exe
+windows-installer/assistant_secrets.py

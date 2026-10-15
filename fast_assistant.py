@@ -46,6 +46,12 @@ if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w', encoding='utf-8')
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+# В EXE потоки бывают в cp1251 — кириллица и '→' в баннере роняли процесс
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 try:
     faulthandler.enable()  # следы нативных падений (pyaudio и пр.) в stderr
 except Exception:
@@ -53,7 +59,23 @@ except Exception:
 
 from pynput import keyboard
 
-LOG_PATH = os.path.join(os.path.dirname(__file__) or '.', "fast_assistant.log")
+# ============================================
+# Куда кладём изменяемые файлы (ключ, настройки, лог, pid, флаги):
+# в заморозке (PyInstaller EXE) — профиль пользователя, при запуске из
+# исходников — рядом со скриптом (текущая работа не ломается)
+# ============================================
+IS_FROZEN = bool(getattr(sys, 'frozen', False))
+IS_WINDOWS = (sys.platform == "win32")
+if IS_FROZEN:
+    _base = os.environ.get("APPDATA") if IS_WINDOWS else os.environ.get("XDG_CONFIG_HOME")
+    APP_DIR = os.path.join(_base or os.path.expanduser("~/.config"), "FastAssistant")
+    os.makedirs(APP_DIR, exist_ok=True)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)  # чтобы находился assistant_secrets.py из APP_DIR
+
+LOG_PATH = os.path.join(APP_DIR, "fast_assistant.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -81,12 +103,18 @@ def handle_thread_exception(args):
 
 threading.excepthook = handle_thread_exception
 
+HAVE_PYAUDIO = True
 try:
     import pyaudiowpatch as pyaudio
     HAVE_WASAPI = True
 except ImportError:
-    import pyaudio
-    HAVE_WASAPI = False
+    try:
+        import pyaudio
+        HAVE_WASAPI = False
+    except ImportError:
+        pyaudio = None
+        HAVE_WASAPI = False
+        HAVE_PYAUDIO = False  # Linux без pyaudio: микрофон через sounddevice
 
 try:
     import sounddevice as sd
@@ -182,7 +210,7 @@ SYSTEM_PROMPT = """Ты голосовой IT-ассистент (Senior SysAdmi
 # (websockets не наследует прокси из env в google-genai — патчим явно)
 # Настройки меняются из UI и сохраняются в assistant_settings.json
 # ============================================
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__) or '.', "assistant_settings.json")
+SETTINGS_PATH = os.path.join(APP_DIR, "assistant_settings.json")
 
 
 def _proxy_alive(url: str) -> bool:
@@ -279,6 +307,7 @@ class AudioCapture:
         # источник звука: "mic" | "system" (WASAPI loopback — системный звук/конференции)
         self.source = "mic"
         self.loopback = None
+        self.sd_lb = None
         self.lb_buf = []
         self.lb_rate = 0
         self.lb_ch = 1
@@ -294,6 +323,8 @@ class AudioCapture:
         return str(info.get("name", "unknown")).strip()
 
     def _log_audio_devices(self):
+        if not getattr(self, "p", None):
+            return
         try:
             logging.info(f"[AUDIO] PyAudio devices: {self.p.get_device_count()}, HAVE_WASAPI={HAVE_WASAPI}")
             for i in range(self.p.get_device_count()):
@@ -434,11 +465,47 @@ class AudioCapture:
         logging.error("[AUDIO] sounddevice microphone fallback failed. Recent errors: %s",
                       "; ".join(errors[-8:]))
 
-    def _open_loopback(self):
-        """Системный звук через WASAPI loopback (нужен pyaudiowpatch)."""
-        if not HAVE_WASAPI:
-            logging.error("[AUDIO] pyaudiowpatch не установлен — системный звук недоступен")
+    def _open_pulse_monitor(self):
+        """Linux: системный звук через монитор PulseAudio/PipeWire (sounddevice)."""
+        if not HAVE_SOUNDDEVICE:
+            logging.error("[AUDIO] sounddevice не установлен — системный звук недоступен")
             return False
+        try:
+            devs = sd.query_devices()
+            mon = next((i for i, d in enumerate(devs)
+                        if int(d.get("max_input_channels", 0) or 0) > 0
+                        and "monitor" in str(d.get("name", "")).lower()), None)
+            if mon is None:
+                logging.error("[AUDIO] PulseAudio-монитор не найден (нет источника системного звука)")
+                return False
+            d = devs[mon]
+            rate = int(float(d.get("default_samplerate") or 48000))
+            self.lb_rate = rate
+            self.lb_ch = 1
+
+            def cb(indata, frames, t, status, self=self):
+                arr = np.asarray(indata, dtype=np.int16).reshape(-1)
+                if not self.muted:
+                    with self.lock:
+                        self.lb_buf.append(arr.copy())
+
+            stream = sd.InputStream(device=mon, channels=1, samplerate=rate,
+                                    dtype="int16", blocksize=1024, callback=cb)
+            stream.start()
+            self.sd_lb = stream
+            self.loopback = stream  # для stop() и проверок "loopback открыт"
+            self.lb_thread_started = True  # отдельный поток не нужен: пишет callback
+            logging.info("[AUDIO] PulseAudio-монитор открыт: %r rate=%s",
+                         str(d.get("name")), rate)
+            return True
+        except Exception as e:
+            logging.error(f"[AUDIO] PulseAudio-монитор открыть не удалось: {e}", exc_info=True)
+            return False
+
+    def _open_loopback(self):
+        """Системный звук: WASAPI loopback (Windows) или монитор PulseAudio (Linux)."""
+        if not HAVE_WASAPI:
+            return self._open_pulse_monitor()
         try:
             wasapi = self.p.get_host_api_info_by_type(pyaudio.paWASAPI)
             spk = self.p.get_device_info_by_index(wasapi["defaultOutputDevice"])
@@ -499,7 +566,8 @@ class AudioCapture:
             return True
         else:
             if self.mic is None:
-                self._open_mic()
+                if HAVE_PYAUDIO:
+                    self._open_mic()
                 if not self.mic:
                     self._open_mic_sounddevice()
                 if self.mic and self.mic_backend == "pyaudio":
@@ -510,10 +578,10 @@ class AudioCapture:
     def start(self):
         self.running = True
         self.mic_error = None
-        self.p = pyaudio.PyAudio()
-        self._log_audio_devices()
-
-        self._open_mic()
+        if HAVE_PYAUDIO:
+            self.p = pyaudio.PyAudio()
+            self._log_audio_devices()
+            self._open_mic()
         if not self.mic:
             self._open_mic_sounddevice()
         if not self.mic:
@@ -630,8 +698,15 @@ class AudioCapture:
                 self.sd_mic.close()
             except Exception:
                 pass
+        if self.sd_lb:
+            try:
+                self.sd_lb.stop()
+                self.sd_lb.close()
+            except Exception:
+                pass
         self.mic = None
         self.sd_mic = None
+        self.sd_lb = None
         if self.p:
             try:
                 self.p.terminate()
@@ -1488,22 +1563,25 @@ class App:
 
 
 _MUTEX_HANDLE = None
-_PID_FILE = os.path.join(os.path.dirname(__file__) or '.', "assistant.pid")
-REPLACE_FLAG = os.path.join(os.path.dirname(__file__) or '.', ".replace_requested")
-USER_CLOSED_FLAG = os.path.join(os.path.dirname(__file__) or '.', ".user_closed")
+_PID_FILE = os.path.join(APP_DIR, "assistant.pid")
+REPLACE_FLAG = os.path.join(APP_DIR, ".replace_requested")
+USER_CLOSED_FLAG = os.path.join(APP_DIR, ".user_closed")
 
 
 def _pid_alive(pid) -> bool:
     try:
-        import ctypes
-        k32 = ctypes.WinDLL('kernel32')
-        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return False
-        code = ctypes.c_ulong()
-        k32.GetExitCodeProcess(h, ctypes.byref(code))
-        k32.CloseHandle(h)
-        return code.value == 259  # STILL_ACTIVE
+        if IS_WINDOWS:
+            import ctypes
+            k32 = ctypes.WinDLL('kernel32')
+            h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return code.value == 259  # STILL_ACTIVE
+        os.kill(int(pid), 0)  # Linux: сигнал 0 = проверка существования
+        return True
     except Exception:
         return False
 
@@ -1533,9 +1611,16 @@ def _replace_previous_instance():
         time.sleep(0.2)
     if _pid_alive(pid):
         logging.warning(f"[APP] Экземпляр PID {pid} не закрылся сам — закрываю по PID")
-        import subprocess
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True)
+        if IS_WINDOWS:
+            import subprocess
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True)
+        else:
+            import signal
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except Exception:
+                pass
         t0 = time.time()
         while time.time() - t0 < 5.0 and _pid_alive(pid):
             time.sleep(0.2)
@@ -1548,6 +1633,8 @@ def _acquire_single_instance_lock() -> bool:
     ВАЖНО: last-error только через WinDLL(use_last_error=True) — windll
     даёт нестабильный результат (был пропуск второго экземпляра)."""
     global _MUTEX_HANDLE
+    if not IS_WINDOWS:
+        return True  # на Linux единственность обеспечивает механизм замены по pid
     try:
         import ctypes
         k32 = ctypes.WinDLL('kernel32', use_last_error=True)
