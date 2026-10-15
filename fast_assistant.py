@@ -39,7 +39,17 @@ import logging
 import os
 import sys
 import faulthandler
-faulthandler.enable()  # следы нативных падений (pyaudio и пр.) в stderr
+
+# Запуск через pythonw (ярлык, без консоли): stdout/stderr отсутствуют,
+# и первый же print()/StreamHandler ронял процесс. Подменяем на nul.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+try:
+    faulthandler.enable()  # следы нативных падений (pyaudio и пр.) в stderr
+except Exception:
+    pass
 
 from pynput import keyboard
 
