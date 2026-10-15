@@ -170,7 +170,11 @@ SYSTEM_PROMPT = """Ты голосовой IT-ассистент (Senior SysAdmi
 # ============================================
 # NETWORK: прокси для REST и для websocket Live-сессии
 # (websockets не наследует прокси из env в google-genai — патчим явно)
+# Настройки меняются из UI и сохраняются в assistant_settings.json
 # ============================================
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__) or '.', "assistant_settings.json")
+
+
 def _proxy_alive(url: str) -> bool:
     try:
         from urllib.parse import urlparse
@@ -183,22 +187,67 @@ def _proxy_alive(url: str) -> bool:
         return False
 
 
-EFFECTIVE_PROXY = ""
-if PROXY and _proxy_alive(PROXY):
-    EFFECTIVE_PROXY = PROXY
-    os.environ.setdefault("HTTP_PROXY", PROXY)
-    os.environ.setdefault("HTTPS_PROXY", PROXY)
-    import google.genai.live as _live_mod
-    _orig_ws_connect = _live_mod.ws_connect
+def _norm_proxy_url(url: str) -> str:
+    """'127.0.0.1:8081' -> 'socks5://127.0.0.1:8081'."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "socks5://" + url
+    return url.rstrip("/")
 
-    def _ws_connect_with_proxy(uri, **kw):
-        kw.setdefault("proxy", PROXY)
-        return _orig_ws_connect(uri, **kw)
 
-    _live_mod.ws_connect = _ws_connect_with_proxy
-    logging.info(f"[NET] Прокси активен: {PROXY}")
-elif PROXY:
-    logging.warning(f"[NET] Прокси {PROXY} не отвечает — прямое соединение")
+def _set_env_proxy(url: str):
+    """env-переменные влияют на httpx/aiohttp внутри google-genai."""
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        if url:
+            os.environ[k] = url
+        else:
+            os.environ.pop(k, None)
+
+
+# runtime-состояние: адрес применяемого прокси ("" = напрямую).
+# Читается ws-патчем ниже и _session_loop при каждом подключении.
+_NET = {"proxy": ""}
+
+
+def _apply_net_proxy(url: str):
+    _NET["proxy"] = url
+    _set_env_proxy(url)
+
+
+def _load_settings() -> dict:
+    s = {"proxy_enabled": bool(PROXY), "proxy_url": PROXY}
+    try:
+        import json
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            s.update({k: v for k, v in json.load(f).items() if k in s})
+    except Exception:
+        pass
+    return s
+
+
+def _save_settings(s: dict):
+    try:
+        import json
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"[NET] Не удалось сохранить настройки: {e}")
+
+
+# ws-патч: прокси применяется к Live-websocket'у всегда, когда задан
+import google.genai.live as _live_mod
+_orig_ws_connect = _live_mod.ws_connect
+
+
+def _ws_connect_with_proxy(uri, **kw):
+    if _NET["proxy"]:
+        kw.setdefault("proxy", _NET["proxy"])
+    return _orig_ws_connect(uri, **kw)
+
+
+_live_mod.ws_connect = _ws_connect_with_proxy
 
 
 # ============================================
@@ -650,6 +699,23 @@ class App:
                        fg="#ffaa00", bg="#1a1a2e", selectcolor="#16213e",
                        activebackground="#1a1a2e", font=("Consolas", 10)).pack(side=tk.LEFT, padx=15)
 
+        # === СЕТЬ: прокси вкл/выкл + адрес ===
+        _settings = _load_settings()
+        netf = tk.Frame(self.root, bg="#1a1a2e")
+        netf.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self.proxy_on = tk.BooleanVar(value=bool(_settings["proxy_enabled"]))
+        tk.Checkbutton(netf, text="Прокси:", variable=self.proxy_on, fg="#58a6ff",
+                       bg="#1a1a2e", selectcolor="#16213e", activebackground="#1a1a2e",
+                       font=("Consolas", 10)).pack(side=tk.LEFT)
+        self.proxy_entry = tk.Entry(netf, width=32, bg="#16213e", fg="#00ff88",
+                                    insertbackground="#00ff88",
+                                    font=("Consolas", 10), relief=tk.FLAT)
+        self.proxy_entry.pack(side=tk.LEFT, padx=6)
+        self.proxy_entry.insert(0, _settings["proxy_url"])
+        tk.Button(netf, text="Применить", command=self._apply_proxy_settings,
+                  bg="#0f3460", fg="#fff", font=("Consolas", 10),
+                  relief=tk.FLAT, padx=10).pack(side=tk.LEFT, padx=6)
+
         # === HEARD ===
         tk.Label(self.root, text="Слышу:", fg="#ff9800", bg="#1a1a2e",
                  font=("Consolas", 9, "bold")).pack(anchor=tk.W, padx=10)
@@ -714,6 +780,9 @@ class App:
         self.root.bind("<FocusOut>", lambda e: self._on_focus(False))
         # фиксируем закрытие окна пользователем (отличаем от падения процесса)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # применяем сохранённые настройки сети до первого подключения
+        self._init_net()
 
     def _on_focus(self, focused: bool):
         if focused == self.window_focused:
@@ -854,6 +923,32 @@ class App:
         self.dot.config(fg=color)
 
     # ---------- hotkeys ----------
+    def _apply_proxy_settings(self):
+        """Кнопка 'Применить': сохранить, применить к сети, пересобрать сессию."""
+        url = _norm_proxy_url(self.proxy_entry.get()) if self.proxy_on.get() else ""
+        warn = ""
+        if url and not _proxy_alive(url):
+            warn = " (НЕ ОТВЕЧАЕТ — проверь адрес/туннель)"
+            logging.warning(f"[NET] Прокси {url} не отвечает")
+        _apply_net_proxy(url)
+        if url:
+            self.proxy_entry.delete(0, tk.END)
+            self.proxy_entry.insert(0, url)
+        _save_settings({"proxy_enabled": bool(url), "proxy_url": url or self.proxy_entry.get().strip()})
+        logging.info(f"[NET] Настройки сети применены: {url or 'напрямую'}")
+        self._set_status(f"СЕТЬ: {('прокси ' + url) if url else 'напрямую'}{warn}",
+                         "#ffaa00" if warn else "#00ff88")
+        # сессия пересоберётся с новыми настройками (контекст сохранится)
+        self._send_to_session(lambda: self.session.close())
+
+    def _init_net(self):
+        """Применить сохранённые настройки сети при старте."""
+        url = _norm_proxy_url(self.proxy_entry.get()) if self.proxy_on.get() else ""
+        if url and not _proxy_alive(url):
+            logging.warning(f"[NET] Прокси {url} не отвечает при старте — пробуем как есть")
+        _apply_net_proxy(url)
+        logging.info(f"[NET] Старт сети: {url or 'напрямую'}")
+
     def _switch_source(self):
         src = self.source_var.get()
         if self.audio and self.audio.running:
@@ -1117,9 +1212,9 @@ class App:
 
     async def _session_loop(self):
         http_options = {'api_version': 'v1alpha'}
-        if EFFECTIVE_PROXY:
-            http_options.update(client_args={'proxy': EFFECTIVE_PROXY},
-                                async_client_args={'proxy': EFFECTIVE_PROXY})
+        if _NET["proxy"]:
+            http_options.update(client_args={'proxy': _NET["proxy"]},
+                                async_client_args={'proxy': _NET["proxy"]})
         client = genai.Client(api_key=API_KEY_GEMINI, http_options=http_options)
 
         order = []

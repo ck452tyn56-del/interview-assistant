@@ -8,3 +8,4 @@ __pycache__/
 !WORKING_VERSION_INSTRUCTION.md
 assistant_secrets.py
 *.env
+assistant_settings.json
