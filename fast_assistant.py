@@ -1452,31 +1452,31 @@ class App:
             self.root.destroy()
 
 
+_MUTEX_HANDLE = None
+
+
 def _acquire_single_instance_lock() -> bool:
     """Named mutex: не даём запустить второй экземпляр (два окна путают).
-    Mutex освобождается ОС автоматически при смерти процесса."""
+    Mutex освобождается ОС автоматически при смерти процесса.
+    ВАЖНО: last-error только через WinDLL(use_last_error=True) — windll
+    даёт нестабильный результат (был пропуск второго экземпляра)."""
+    global _MUTEX_HANDLE
     try:
         import ctypes
-        ctypes.windll.kernel32.CreateMutexW(None, False, "FastAssistant::single::instance")
-        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        _MUTEX_HANDLE = k32.CreateMutexW(None, False, "FastAssistant::single::instance")
+        # держим ссылку на хэндл до конца процесса — mutex жив, пока открыт хэндл
+        return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return True  # не Windows или ошибка — не блокируем
 
 
 if __name__ == "__main__":
     if not _acquire_single_instance_lock():
+        # без блокирующих диалогов: молча логируем и выходим —
+        # висящий messagebox сам становился вторым «призрачным» процессом
         print("Уже запущен другой экземпляр Fast Assistant — этот закроется.")
         logging.info("[APP] Повторный запуск отклонён: экземпляр уже работает")
-        try:
-            import tkinter.messagebox as mb
-            r = tk.Tk()
-            r.withdraw()
-            mb.showinfo("Fast Assistant",
-                        "Уже запущен другой экземпляр приложения.\n"
-                        "Это окно сейчас закроется.")
-            r.destroy()
-        except Exception:
-            pass
         sys.exit(42)  # супервизор знает этот код: другой экземпляр работает
 
     print(f"Fast Assistant v27 | MODE={MODE} | модели: " +
