@@ -130,7 +130,7 @@ PREFIX_PADDING_MS = 200   # захват начала речи (v26 было 500
 SILENCE_MS = 500          # пауза до конца реплики (v26 было 800 — главная задержка реакции)
 
 MAX_FONT = 16
-MIN_FONT = 5
+MIN_FONT = 9  # ниже не уменьшаем: лучше прокрутка, чем нечитаемый текст
 
 SYSTEM_PROMPT = """Ты голосовой IT-ассистент (Senior SysAdmin / DevOps / SRE).
 Отвечай на русском, КОРОТКО и мгновенно.
@@ -587,7 +587,11 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Fast Assistant — Google Live (PTT)")
-        self.root.geometry("1000x700+50+50")
+        self.root.geometry("1100x800+40+30")
+        try:
+            self.root.state('zoom')  # старт развёрнутым: обе панели ответов сразу видны
+        except Exception:
+            pass
         self.root.attributes("-topmost", True)
         self.root.configure(bg="#1a1a2e")
 
@@ -632,7 +636,7 @@ class App:
         srcf.pack(fill=tk.X, padx=10, pady=(0, 4))
         tk.Label(srcf, text="Источник:", fg="#888", bg="#1a1a2e",
                  font=("Consolas", 10)).pack(side=tk.LEFT)
-        self.source_var = tk.StringVar(value="mic")
+        self.source_var = tk.StringVar(value="system")  # по умолчанию системный звук
         for val, txt in (("mic", "🎤 Микрофон"), ("system", "🔊 Система (конференции)")):
             tk.Radiobutton(srcf, text=txt, variable=self.source_var, value=val,
                            command=self._switch_source, fg="#ccc", bg="#1a1a2e",
@@ -655,12 +659,18 @@ class App:
         self.heard.pack(fill=tk.X, padx=10, pady=2)
         self.heard.configure(state=tk.DISABLED)  # только чтение: без каретки и правки
 
-        # === ANSWERS: две чередующиеся панели, прошлый ответ не перекрывается ===
-        tk.Label(self.root, text="Ответы (чередуются строка 1 / строка 2):", fg="#00ff88",
+        # === ANSWERS: две чередующиеся панели, жёстко 50/50 по высоте ===
+        tk.Label(self.root, text="Ответы (чередуются, активная помечена →):", fg="#00ff88",
                  bg="#1a1a2e", font=("Consolas", 9, "bold")).pack(anchor=tk.W, padx=10)
 
-        self.p1 = self._panel("ОТВЕТ [1]", "#1a3a1a")
-        self.p2 = self._panel("ОТВЕТ [2]", "#1a2a3a")
+        grid = tk.Frame(self.root, bg="#1a1a2e")
+        grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+        grid.rowconfigure(0, weight=1, uniform="rows")
+        grid.rowconfigure(1, weight=1, uniform="rows")
+        self._grid = grid
+
+        self.p1 = self._panel("ОТВЕТ [1]", "#1a3a1a", 0)
+        self.p2 = self._panel("ОТВЕТ [2]", "#1a2a3a", 1)
 
         # State
         self.current_row = 1
@@ -690,6 +700,7 @@ class App:
         self._ptt_released_at = None
         self._released_while_disconnected = False
         self._end_after_drain = False
+        self._unfocused_press_at = None
 
         # поток цикла переподключения (чтобы не плодить второй при повторном CONNECT)
         self._loop_thread = None
@@ -721,9 +732,10 @@ class App:
             elif self.connected and not self._global_space:
                 self._set_status("⏸ не в фокусе", "#888888")
 
-    def _panel(self, title, bg):
-        f = tk.Frame(self.root, bg="#1a1a2e")
-        f.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+    def _panel(self, title, bg, row):
+        f = tk.Frame(self._grid, bg="#1a1a2e")
+        f.grid(row=row, column=0, sticky="nsew", pady=3)
+        self._grid.columnconfigure(0, weight=1)
         lbl = tk.Label(f, text=title, fg="#666", bg="#1a1a2e", font=("Consolas", 10, "bold"))
         lbl.pack(anchor=tk.W)
         txt = scrolledtext.ScrolledText(f, bg=bg, fg="#00ff88", font=("Consolas", MAX_FONT),
@@ -808,8 +820,24 @@ class App:
                     logging.warning(f"[PTT] Речь не распознана "
                                     f"(макс RMS={getattr(self.audio, 'rms_max', 0):.0f}) — слишком тихо?")
                     self._set_status("НЕ УСЛЫШАЛ — ГОВОРИ ГРОМЧЕ", "#ff4444")
-                elif self._turn_heard_speech:
-                    self._awaiting_speech_check = False
+
+            # пробел нажат вне фокуса окна — объясняем, почему ничего не происходит
+            if (self._unfocused_press_at and not self.ptt_held
+                    and time.time() - self._unfocused_press_at < 3.0
+                    and not self._global_space):
+                self._set_status("⏸ ОКНО НЕ В ФОКУСЕ — пробел не работает", "#ffaa00")
+            elif self._unfocused_press_at and time.time() - self._unfocused_press_at >= 3.0:
+                self._unfocused_press_at = None
+
+            # watchdog: речь была распознана, пробел отпущен, но ответа нет >8с —
+            # вероятна потеря реплики сервером; пересобираем сессию (контекст сохранится)
+            if (self._turn_heard_speech and self._ptt_released_at
+                    and not self._turn_first_text and not self.ptt_held
+                    and self.connected and time.time() - self._ptt_released_at > 8.0):
+                logging.warning("[WATCHDOG] Сервер молчит после реплики — пересобираю сессию")
+                self._set_status("СЕРВЕР МОЛЧИТ — ПЕРЕСОБИРАЮ СЕССИЮ", "#ff4444")
+                self._ptt_released_at = None
+                self._send_to_session(lambda: self.session.close())
         except Exception:
             pass
         finally:
@@ -850,6 +878,10 @@ class App:
                     if self.window_focused or self._global_space:
                         self._ptt_start()
                         suppress = True
+                    else:
+                        # подсказка, почему пробел не работает (иначе это выглядит
+                        # как «ассистент не отвечает»)
+                        self._unfocused_press_at = time.time()
                 elif up and self.ptt_held:
                     self._ptt_end()
                     suppress = True
@@ -963,6 +995,7 @@ class App:
     def _on_output_text(self, chunk):
         if not self._turn_first_text:
             self._turn_first_text = True
+            self._ptt_released_at = None  # ответ пошёл — watchdog не нужен
             if self._turn_started_at:
                 lat = time.time() - self._turn_started_at
                 self.latency_lbl.config(text=f"⚡ {lat:.2f}s")
@@ -981,6 +1014,7 @@ class App:
         logging.info(f"[HEARD] Вопрос: {self.heard_final}")
         logging.info(f"[TURN] Complete, row={self.current_row}, ответ: {answer[:120]}")
         self.response = ""
+        self._ptt_released_at = None
         self._turn_started_at = None
         self.current_row = 2 if self.current_row == 1 else 1
         self._highlight()
