@@ -109,6 +109,13 @@ MODEL_CANDIDATES = [
 ]
 
 MODE = "ptt"        # "ptt" = пробел держать=говорить | "auto" = слушает всегда, VAD
+# Как работает пробел в MODE="ptt":
+#  "vad"    — пока пробел зажат, звук идёт на сервер, серверный VAD сам ловит конец речи
+#             (пауза 500мс): транскрипция видна В РЕАЛЬНОМ ВРЕМЕНИ, ответ может начаться
+#             ещё до отпускания пробела. Рекомендуется.
+#  "manual" — строгий режим: реплика заканчивается только отпусканием пробела;
+#             транскрипция приходит только ПОСЛЕ отпускания.
+PTT_STYLE = "vad"
 CHUNK_DURATION = 0.1  # 100мс — проверено в v26
 
 # Прокси для обхода региональной блокировки Gemini API (SSH-туннель: plink -D 8081).
@@ -630,6 +637,8 @@ class App:
         # PTT
         self.ptt_held = False
         self.window_focused = False  # пробел работает только при фокусе на окне
+        self._manual_activity = (MODE == "ptt" and PTT_STYLE == "manual")
+        self._ptt_released_at = None
 
         # поток цикла переподключения (чтобы не плодить второй при повторном CONNECT)
         self._loop_thread = None
@@ -726,8 +735,9 @@ class App:
 
             # если после отпускания пробела за 3с речь так и не распозналась —
             # скорее всего было слишком тихо, подсказываем
-            if (self._awaiting_speech_check and self._turn_started_at
-                    and time.time() - self._turn_started_at > 3.0):
+            ref_time = self._turn_started_at or self._ptt_released_at
+            if (self._awaiting_speech_check and ref_time
+                    and time.time() - ref_time > 3.0):
                 self._awaiting_speech_check = False
                 if not self._turn_heard_speech and not self._turn_first_text and self.connected:
                     logging.warning(f"[PTT] Речь не распознана "
@@ -757,6 +767,28 @@ class App:
         logging.info(f"[UI] Источник переключён: {src}")
 
     def _hotkey(self):
+        VK_SPACE = 0x20
+
+        def space_filter(msg, data):
+            """Windows: глотаем пробел, когда он управляет PTT, чтобы он не
+            печатался как зажатая клавиша в редакторах и чатах."""
+            try:
+                if MODE != "ptt" or data.vkCode != VK_SPACE:
+                    return None
+                down = msg in (0x0100, 0x0104)   # WM_KEYDOWN / WM_SYSKEYDOWN
+                up = msg in (0x0101, 0x0105)      # WM_KEYUP / WM_SYSKEYUP
+                if down:
+                    if not self.window_focused and not self._global_space:
+                        return None  # пробел не наш — печатается как обычно
+                    self._ptt_start()
+                    return False     # не пропускать в другие приложения
+                if up and self.ptt_held:
+                    self._ptt_end()
+                    return False
+            except Exception:
+                pass
+            return None
+
         def press(k):
             if k == keyboard.Key.space:
                 # пробел глобально — только если включена галка (для конференций);
@@ -764,7 +796,7 @@ class App:
                 if not self.window_focused and not self._global_space:
                     return
                 if MODE == "ptt":
-                    self._ptt_start()
+                    self._ptt_start()  # повторный вызов защищён ptt_held
                 else:
                     if self.audio:
                         self.audio.muted = True
@@ -782,7 +814,13 @@ class App:
                 self.root.after(0, lambda: self._set_status("LISTENING", "#00ff88")
                                 if self.connected else None)
 
-        keyboard.Listener(on_press=press, on_release=release).start()
+        try:
+            listener = keyboard.Listener(on_press=press, on_release=release,
+                                         win32_event_filter=space_filter)
+        except TypeError:
+            # старый pynput без win32_event_filter — работаем как раньше
+            listener = keyboard.Listener(on_press=press, on_release=release)
+        listener.start()
 
     def _send_to_session(self, coro_factory):
         """Безопасно дёрнуть метод сессии из потока клавиатуры/UI."""
@@ -812,9 +850,10 @@ class App:
         self._awaiting_speech_check = False
         self.root.after(0, lambda: self.heard.delete(1.0, tk.END))
         self.root.after(0, lambda: self._set_status("СЛУШАЮ...", "#00ff88"))
-        logging.info("[PTT] start (activity_start)")
-        self._send_to_session(
-            lambda: self.session.send_realtime_input(activity_start=types.ActivityStart()))
+        logging.info("[PTT] start: микрофон открыт")
+        if self._manual_activity:
+            self._send_to_session(
+                lambda: self.session.send_realtime_input(activity_start=types.ActivityStart()))
 
     def _ptt_end(self):
         if not self.ptt_held:
@@ -822,14 +861,17 @@ class App:
         self.ptt_held = False
         if self.audio:
             self.audio.muted = True
-        self._turn_started_at = time.time()  # точка отсчёта скорости реакции
+        self._ptt_released_at = time.time()
         self._awaiting_speech_check = True
-        logging.info(f"[PTT] end (activity_end), макс RMS за реплику: "
+        logging.info(f"[PTT] end: микрофон закрыт, макс RMS за реплику: "
                      f"{getattr(self.audio, 'rms_max', 0):.0f}")
-        self._send_to_session(
-            lambda: self.session.send_realtime_input(activity_end=types.ActivityEnd()))
-        self.root.after(0, lambda: self._set_status(
-            "ОБДУМЫВАЮ...", "#ffaa00") if self.connected else None)
+        if self._manual_activity:
+            self._turn_started_at = time.time()  # точка отсчёта скорости реакции
+            self._send_to_session(
+                lambda: self.session.send_realtime_input(activity_end=types.ActivityEnd()))
+        if self._turn_heard_speech:
+            self.root.after(0, lambda: self._set_status(
+                "ОБДУМЫВАЮ...", "#ffaa00") if self.connected else None)
 
     def _force_answer(self):
         """F9 (auto-режим): немедленно завершить реплику, не дожидаясь паузы VAD."""
@@ -918,11 +960,13 @@ class App:
                 logging.warning(f"[SESSION] thinking_level не поддержан: {e}")
                 return None
 
-        if MODE == "ptt":
-            # PTT: начало/конец реплики шлём сами (activityStart/End);
+        if self._manual_activity:
+            # strict-PTT: начало/конец реплики шлём сами (activityStart/End);
             # при disabled=True API запрещает задавать поля чувствительности
             aad = types.AutomaticActivityDetection(disabled=True)
         else:
+            # авто-VAD (и PTT-стиль "vad"): пауза 500мс — быстрый конец реплики,
+            # транскрипция стримится во время речи
             aad = types.AutomaticActivityDetection(
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
@@ -1070,7 +1114,8 @@ class App:
                     self.heard_final = (self.heard_final + " " + inp.text).strip()
                     self._turn_heard_speech = True
                     self.root.after(0, lambda x=self.heard_final: self._show_heard(x))
-                    if MODE == "auto":
+                    if not self._manual_activity:
+                        # VAD-режим: конец речи = момент финальной транскрипции
                         self._turn_started_at = time.time()
                         self._turn_first_text = False
                     logging.info(f"[HEARD] {self.heard_final}")
