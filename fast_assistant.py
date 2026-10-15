@@ -38,6 +38,8 @@ import numpy as np
 import logging
 import os
 import sys
+import faulthandler
+faulthandler.enable()  # следы нативных падений (pyaudio и пр.) в stderr
 
 from pynput import keyboard
 
@@ -671,8 +673,12 @@ class App:
         # фокус окна: без него пробел игнорируется (чтобы печатать в других окнах)
         self.root.bind("<FocusIn>", lambda e: self._on_focus(True))
         self.root.bind("<FocusOut>", lambda e: self._on_focus(False))
+        # фиксируем закрытие окна пользователем (отличаем от падения процесса)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_focus(self, focused: bool):
+        if focused == self.window_focused:
+            return  # событие всплывает от каждого виджета — берём только смену состояния
         was = self.window_focused
         self.window_focused = focused
         if focused:
@@ -1215,6 +1221,13 @@ class App:
         if not (self.connected or self.should_reconnect):
             logging.info("[APP] Автоподключение при старте")
             self.connect()
+
+    def _on_close(self):
+        logging.info("[APP] Окно закрыто пользователем")
+        try:
+            self.disconnect()
+        finally:
+            self.root.destroy()
 
 
 if __name__ == "__main__":
