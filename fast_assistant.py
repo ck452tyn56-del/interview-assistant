@@ -829,15 +829,21 @@ class App:
             elif self._unfocused_press_at and time.time() - self._unfocused_press_at >= 3.0:
                 self._unfocused_press_at = None
 
-            # watchdog: речь была распознана, пробел отпущен, но ответа нет >8с —
-            # вероятна потеря реплики сервером; пересобираем сессию (контекст сохранится)
-            if (self._turn_heard_speech and self._ptt_released_at
-                    and not self._turn_first_text and not self.ptt_held
-                    and self.connected and time.time() - self._ptt_released_at > 8.0):
-                logging.warning("[WATCHDOG] Сервер молчит после реплики — пересобираю сессию")
-                self._set_status("СЕРВЕР МОЛЧИТ — ПЕРЕСОБИРАЮ СЕССИЮ", "#ff4444")
-                self._ptt_released_at = None
-                self._send_to_session(lambda: self.session.close())
+            # watchdog: два бюджета. Если сервер не подал НИКАКИХ признаков жизни
+            # (нет ни транскрипции, ни ответа) 8с — реплика потеряна, пересобираем.
+            # Если транскрипция пришла (реплика принята) — ждём генерацию до 25с:
+            # длинные вопросы (30-60с речи) сервер обрабатывает намного дольше,
+            # и обрывать его посреди ответа нельзя (был инцидент: 47с вопрос,
+            # ответ обрезался до 2 слов).
+            if (self._ptt_released_at and not self._turn_first_text
+                    and not self.ptt_held and self.connected):
+                budget = 25.0 if self._turn_heard_speech else 8.0
+                if time.time() - self._ptt_released_at > budget:
+                    logging.warning(f"[WATCHDOG] Сервер молчит после реплики "
+                                    f"(heard={self._turn_heard_speech}) — пересобираю сессию")
+                    self._set_status("СЕРВЕР МОЛЧИТ — ПЕРЕСОБИРАЮ СЕССИЮ", "#ff4444")
+                    self._ptt_released_at = None
+                    self._send_to_session(lambda: self.session.close())
         except Exception:
             pass
         finally:
