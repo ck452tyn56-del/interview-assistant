@@ -16,3 +16,5 @@ dist/
 *.spec
 windows-installer/FastAssistant.exe
 windows-installer/assistant_secrets.py
+setup.sed
+windows-installer/
