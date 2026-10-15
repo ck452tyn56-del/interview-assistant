@@ -135,6 +135,15 @@ MIN_FONT = 5
 SYSTEM_PROMPT = """Ты голосовой IT-ассистент (Senior SysAdmin / DevOps / SRE).
 Отвечай на русском, КОРОТКО и мгновенно.
 
+ДИАЛОГ КАК С ЧЕЛОВЕКОМ (по голосовой связи):
+- Реплика — не всегда полный вопрос. Это может быть уточнение, правка или подсказка
+  к прошлому разговору: "нет, я про другой сервер", "забудь, вопрос другой",
+  "а если кэша нет?", "именно", "подсказка: там iowait".
+- Понимай её в контексте предыдущих реплик и давай обновлённый или дополненный ответ.
+- Правку принимай без комментариев — просто исправленный ответ.
+- Если просят подробнее — раскрывай конкретнее, но без воды.
+- Никаких "как ИИ", "я ассистент", пересказов своих правил и лишних извинений.
+
 ГЛАВНОЕ - КОРОТКО:
 - Максимум 2-3 предложения, сразу суть. Без вступлений, приветствий и встречных вопросов.
 - Команда консоли / путь / параметр — просто команда + 1 строка пояснения.
@@ -679,6 +688,8 @@ class App:
         self.window_focused = False  # пробел работает только при фокусе на окне
         self._manual_activity = (MODE == "ptt" and PTT_STYLE == "manual")
         self._ptt_released_at = None
+        self._released_while_disconnected = False
+        self._end_after_drain = False
 
         # поток цикла переподключения (чтобы не плодить второй при повторном CONNECT)
         self._loop_thread = None
@@ -771,11 +782,11 @@ class App:
 
     def _highlight(self):
         if self.current_row == 1:
-            self.p1["lbl"].config(fg="#00ff88")
-            self.p2["lbl"].config(fg="#444")
+            self.p1["lbl"].config(text="→ ОТВЕТ [1]", fg="#00ff88")
+            self.p2["lbl"].config(text="ОТВЕТ [2]", fg="#444")
         else:
-            self.p1["lbl"].config(fg="#444")
-            self.p2["lbl"].config(fg="#00ff88")
+            self.p1["lbl"].config(text="ОТВЕТ [1]", fg="#444")
+            self.p2["lbl"].config(text="→ ОТВЕТ [2]", fg="#00ff88")
 
     def _update_volume_display(self):
         try:
@@ -900,8 +911,7 @@ class App:
         if self.ptt_held:  # автоповтор клавиши
             return
         if not self.connected:
-            self.root.after(0, lambda: self._set_status("НЕТ СВЯЗИ — жди подключения", "#ff4444"))
-            return
+            logging.info("[PTT] start во время переподключения — activity_start уйдёт при готовности сессии")
         self.ptt_held = True
         if self.audio:
             self.audio.muted = False
@@ -927,6 +937,9 @@ class App:
             self.audio.muted = True
         self._ptt_released_at = time.time()
         self._awaiting_speech_check = True
+        if not self.connected:
+            # сессия переподключается: реплику дослылаем на новой сессии целиком
+            self._released_while_disconnected = True
         logging.info(f"[PTT] end: микрофон закрыт, макс RMS за реплику: "
                      f"{getattr(self.audio, 'rms_max', 0):.0f}")
         if self._manual_activity:
@@ -954,9 +967,10 @@ class App:
                 lat = time.time() - self._turn_started_at
                 self.latency_lbl.config(text=f"⚡ {lat:.2f}s")
                 logging.info(f"[LATENCY] Реакция: {lat:.2f}s")
-            # чистим панель от позапрошлого ответа
+            # чистим панель от позапрошлого ответа и метим её стрелкой
             panel = self.p1 if self.current_row == 1 else self.p2
             self._clear_text(panel["txt"])
+            panel["lbl"].config(text=f"→ ОТВЕТ [{self.current_row}]")
 
         self.response += chunk
         panel = self.p1 if self.current_row == 1 else self.p2
@@ -1122,8 +1136,33 @@ class App:
             ready_txt = "ГОТОВ — держи ПРОБЕЛ" if MODE == "ptt" else "LISTENING"
             self.root.after(0, lambda: self._set_status(ready_txt, "#00ff88"))
 
-        # PTT-стейт не должен переживать реконнект
-        self.ptt_held = False
+        # Сервер закрывает поток после каждого тура -> постоянные реконнекты.
+        # На новой сессии: чистим накопившийся backlog (оставляя хвост ~1с —
+        # там начало речи) и восстанавливаем состояние PTT.
+        drained = 0
+        kept = b""
+        while True:
+            try:
+                data = self.q.get_nowait()
+                drained += 1
+                kept = (kept + data)[-32000:]  # последние ~1с (16кГц int16)
+            except queue.Empty:
+                break
+        if drained:
+            if kept:
+                self.q.put(kept)
+            logging.info(f"[AUDIO] Слит backlog {drained} чанков, сохранён хвост {len(kept)//2} сэмплов")
+
+        if self.ptt_held:
+            # пробел всё ещё зажат — реплика началась до реконнекта, досылаем старт
+            logging.info("[PTT] Сессия готова при зажатом пробеле — досылаю activity_start")
+            await self.session.send_realtime_input(activity_start=types.ActivityStart())
+        elif self._released_while_disconnected:
+            # реплика целиком прозвучала во время реконнекта: досылаем её целиком
+            self._released_while_disconnected = False
+            logging.info("[PTT] Реплика была во время реконнекта — досылаю start, конец после дренажа")
+            await self.session.send_realtime_input(activity_start=types.ActivityStart())
+            self._end_after_drain = True
 
         await asyncio.gather(self._send_audio(), self._recv(), return_exceptions=True)
 
@@ -1136,6 +1175,11 @@ class App:
                     await self.session.send_realtime_input(audio=types.Blob(
                         mime_type="audio/pcm;rate=16000", data=data))
             except queue.Empty:
+                if self._end_after_drain:
+                    # вся досланная реплика ушла — закрываем её
+                    self._end_after_drain = False
+                    await self.session.send_realtime_input(activity_end=types.ActivityEnd())
+                    logging.info("[PTT] Дослан activity_end после дренажа очереди")
                 continue
             except asyncio.CancelledError:
                 raise
@@ -1208,6 +1252,9 @@ class App:
                 logging.error(f"[RECV] Error: {e}")
 
         self.connected = False
+        if self.should_reconnect:
+            # штатный путь: сервер закрывает поток после каждого тура
+            logging.info("[RECV] Поток завершён сервером — переподключаюсь с контекстом (resume)")
         if not self.should_reconnect:
             self.root.after(0, lambda: self._set_status("Disconnected", "#ff4444"))
 
