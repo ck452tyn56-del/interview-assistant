@@ -1317,7 +1317,33 @@ class App:
             self.root.destroy()
 
 
+def _acquire_single_instance_lock() -> bool:
+    """Named mutex: не даём запустить второй экземпляр (два окна путают).
+    Mutex освобождается ОС автоматически при смерти процесса."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.CreateMutexW(None, False, "FastAssistant::single::instance")
+        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True  # не Windows или ошибка — не блокируем
+
+
 if __name__ == "__main__":
+    if not _acquire_single_instance_lock():
+        print("Уже запущен другой экземпляр Fast Assistant — этот закроется.")
+        logging.info("[APP] Повторный запуск отклонён: экземпляр уже работает")
+        try:
+            import tkinter.messagebox as mb
+            r = tk.Tk()
+            r.withdraw()
+            mb.showinfo("Fast Assistant",
+                        "Уже запущен другой экземпляр приложения.\n"
+                        "Это окно сейчас закроется.")
+            r.destroy()
+        except Exception:
+            pass
+        sys.exit(42)  # супервизор знает этот код: другой экземпляр работает
+
     print(f"Fast Assistant v27 | MODE={MODE} | модели: " +
           ", ".join(m.replace('models/', '') for m, _ in MODEL_CANDIDATES))
     print("Ускорения: без второй модели, без loopback, PTT=мгновенный конец реплики,"
