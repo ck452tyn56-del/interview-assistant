@@ -218,6 +218,9 @@ class AudioCapture:
         # кольцевой буфер: последняя секунда звука ДО нажатия пробела,
         # чтобы не терялось начало реплики (важно для системного звука в конференциях)
         self._ring = np.array([], dtype=np.int16)
+        self._mic_thread = None
+        self._lb_thread = None
+        self._feed_thread = None
 
     def _safe_device_name(self, info):
         return str(info.get("name", "unknown")).strip()
@@ -386,7 +389,8 @@ class AudioCapture:
                          self._safe_device_name(spk), self.lb_rate, self.lb_ch)
             if not self.lb_thread_started:
                 self.lb_thread_started = True
-                threading.Thread(target=self._read_lb, daemon=True).start()
+                self._lb_thread = threading.Thread(target=self._read_lb, daemon=True)
+                self._lb_thread.start()
             return True
         except Exception as e:
             self.loopback = None
@@ -431,7 +435,8 @@ class AudioCapture:
                 if not self.mic:
                     self._open_mic_sounddevice()
                 if self.mic and self.mic_backend == "pyaudio":
-                    threading.Thread(target=self._read_mic, daemon=True).start()
+                    self._mic_thread = threading.Thread(target=self._read_mic, daemon=True)
+                    self._mic_thread.start()
             return self.mic is not None
 
     def start(self):
@@ -448,8 +453,10 @@ class AudioCapture:
             return False
 
         if self.mic_backend == "pyaudio":
-            threading.Thread(target=self._read_mic, daemon=True).start()
-        threading.Thread(target=self._feed, daemon=True).start()
+            self._mic_thread = threading.Thread(target=self._read_mic, daemon=True)
+            self._mic_thread.start()
+        self._feed_thread = threading.Thread(target=self._feed, daemon=True)
+        self._feed_thread.start()
         return True
 
     def _resample(self, arr, fr, to):
@@ -531,6 +538,11 @@ class AudioCapture:
 
     def stop(self):
         self.running = False
+        # ГОНКА: закрывать аудиопотоки можно только после того, как потоки-читатели
+        # вышли из read() — иначе нативный крах (тихие падения процесса)
+        for t in (self._lb_thread, self._mic_thread, self._feed_thread):
+            if t and t.is_alive():
+                t.join(timeout=1.5)
         if self.loopback:
             try:
                 self.loopback.stop_stream()
@@ -550,8 +562,13 @@ class AudioCapture:
                 self.sd_mic.close()
             except Exception:
                 pass
+        self.mic = None
+        self.sd_mic = None
         if self.p:
-            self.p.terminate()
+            try:
+                self.p.terminate()
+            except Exception:
+                pass
 
 
 # ============================================
@@ -969,7 +986,10 @@ class App:
         self.btn.config(text="DISCONNECT", bg="#dc3545")
         self.should_reconnect = True
 
-        # не плодим второй цикл, если прежний ещё жив
+        # не плодим второй цикл, если прежний ещё жив; после disconnect даём ему
+        # секунду выйти, иначе connect после disconnect мог застрять
+        if self._loop_thread and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=1.0)
         if self._loop_thread and self._loop_thread.is_alive():
             logging.info("[SESSION] Цикл переподключения уже работает")
             return
@@ -1200,18 +1220,33 @@ class App:
         self.btn.config(text="CONNECT", bg="#28a745")
 
     def reset(self):
-        self.disconnect()
-        self.resume_handle = None
+        """Новый диалог БЕЗ разрыва соединения: скорость не теряем.
+        Реплики между нажатиями пробела копятся в контексте сессии (уточнения
+        и правки работают сами). Эта кнопка — единственный способ начать с чистого листа."""
+        logging.info("[RESET] Новый диалог (без переподключения)")
+        # текстовый маркер в сессию: предыдущая история не учитывается;
+        # turn_complete=False -> модель не отвечает на сам маркер
+        self._send_to_session(lambda: self.session.send_client_content(
+            turns=[types.Content(role="user", parts=[types.Part(text=(
+                "«Сброс диалога». Начни новый чистый диалог: следующая реплика "
+                "пользователя — первый вопрос нового диалога, прежнюю историю "
+                "не учитывай."))])],
+            turn_complete=False))
+        self.resume_handle = None  # при следующем реконнекте — новая сессия без истории
         self.current_row = 1
         self.heard_final = ""
+        self.response = ""
+        self._turn_first_text = False
+        self._turn_heard_speech = False
+        self._turn_started_at = None
+        self._ptt_released_at = None
+        self._awaiting_speech_check = False
         self._highlight()
         for p in [self.p1, self.p2]:
             self._clear_text(p["txt"])
         self._clear_text(self.heard)
-        self.response = ""
         self.latency_lbl.config(text="⚡ --")
-        time.sleep(0.3)
-        self.connect()
+        self._set_status("НОВЫЙ ДИАЛОГ — держи ПРОБЕЛ", "#00ff88")
 
     def run(self):
         self.root.after(1000, self._autoconnect)
@@ -1224,6 +1259,11 @@ class App:
 
     def _on_close(self):
         logging.info("[APP] Окно закрыто пользователем")
+        # флаг для супервизора: перезапускать не нужно
+        try:
+            open(os.path.join(os.path.dirname(__file__) or '.', '.user_closed'), 'w').close()
+        except Exception:
+            pass
         try:
             self.disconnect()
         finally:

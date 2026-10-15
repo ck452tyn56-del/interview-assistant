@@ -6,7 +6,8 @@ while true; do
   py fast_assistant.py
   CODE=$?
   echo "[SUPERVISOR] процесс завершился с кодом $CODE"
-  if [ $CODE -eq 0 ]; then
+  if [ -f .user_closed ]; then
+    rm -f .user_closed
     echo "[SUPERVISOR] окно закрыл пользователь — выходим"
     break
   fi
